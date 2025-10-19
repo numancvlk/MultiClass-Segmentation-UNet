@@ -10,7 +10,7 @@ from utils import loadCheckpoint, saveCheckpoint, printTrainTime, getLoaders,tra
 
 
 #HYPERPARAMETERS
-EPOCHS = 100
+EPOCHS = 200
 LEARNING_RATE = 1e-4
 BATCH_SIZE = 32
 NUM_WORKERS = 2

@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 from torchvision import transforms
 from skimage import measure
 import numpy as np
-
+from torch.utils.data import Subset
 #SCRIPTS
 from model import DEVICE
 
@@ -97,7 +97,9 @@ def trainStep(model: torch.nn.Module,
 
     for batch, (xTrain,yTrain) in enumerate(loop):
         xTrain, yTrain = xTrain.to(device), yTrain.to(device).squeeze(1).long()
-        yTrain = torch.clamp(yTrain, 0, 3-1)
+        # yTrain = torch.clamp(yTrain, 0, 3-1)
+        yTrain = yTrain - 1
+        yTrain = torch.clamp(yTrain, 0, 2)
 
         with torch.autocast(device_type="cuda", enabled=True):
             trainPred = model(xTrain)
@@ -117,7 +119,9 @@ def validationStep(model, dataLoader, device, numClasses=3, savePred=False):
     with torch.no_grad():
         for batch_idx, (images, masks) in enumerate(dataLoader):
             images, masks = images.to(device), masks.to(device).squeeze(1).long()
-            masks = torch.clamp(masks, 0, 3-1)
+            # masks = torch.clamp(masks, 0, 3-1)
+            masks = masks - 1
+            masks = torch.clamp(masks, 0, 2)
             outputs = model(images)
 
             valAcc += pixelAccuracy(outputs, masks)
@@ -169,12 +173,12 @@ def meanIoU(pred,target,numClasses):
         union = (predInds | targetInds).sum().float() #yani tahmin veya gerçek maskede olan tüm pikseller
 
         if union == 0: #bu sınıf o görüntüde hiç yok
-            iou = torch.tensor(0.1,device=DEVICE)
+            continue
         else: 
             iou = intersection / union #normal IoU formülü
-        
+            ious.append(iou)
         #Bu sınıfın IoU değerini listeye ekle
-        ious.append(iou)
+        
     #Tüm sınıfların IoU ortalamasını alıyoruz
     return torch.mean(torch.stack(ious)).item()
 
@@ -201,105 +205,92 @@ def meanDiceScore(pred,target,numClasses):
         total = predInds.sum() + targetInds.sum() #tahmin ve ground truth maskesindeki toplam pikseller
 
         if total == 0: #Eğer o sınıfa ait hiç piksel yoksa
-             dice = torch.tensor(1.0, device=DEVICE)
+             continue
         else:
             dice = (2.0 * intersection) / total #Dice Score formülü
+            dices.append(dice)
         
-        dices.append(dice)
     #Tüm sınıfların Dice Score ortalamasını alıyoruz
     return torch.mean(torch.stack(dices)).item()
 
-MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 def savePredictions(model, dataLoader, device, saveDir="predictions", numSamples=4):
     model.eval()
     os.makedirs(saveDir, exist_ok=True)
 
-    # 1. ÖZEL RENK HARİTASI TANIMLAMA (KESİN İSTENEN EŞLEŞME)
-    # Maske Değeri: 0 (Pet)    -> Renk: Yeşil (#00FF00)
-    # Maske Değeri: 1 (BG)     -> Renk: Kırmızı (#FF0000)
-    # Maske Değeri: 2 (Border) -> Renk: Sarı (#FFFF00)
-    colors = ['#00FF00', '#FF0000', '#FFFF00'] 
-    cmap = mcolors.ListedColormap(colors)
+    class_colors = {
+        0: [0, 0, 1], # Mavi: Pet
+        1: [0, 1, 0], # Yeşil: Background
+        2: [1, 0, 0]  # Kırmızı: Border
+    } 
     
-    # Sınıfların sınırları
-    bounds = [-0.5, 0.5, 1.5, 2.5]
-    norm = mcolors.BoundaryNorm(bounds, cmap.N)
-    
-    # Renk Skalası Etiketleri
-    class_labels = ['Pet (0) - Yeşil', 'Background (1) - Kırmızı', 'Border (2) - Sarı']
-
+    # YENİ: Toplam kaç resim kaydedildiğini takip eden sayaç
+    saved_count = 0 
 
     with torch.no_grad():
         for batch_idx, (images, masks) in enumerate(dataLoader):
-            
             images = images.to(device)
-            # Maske şekli (N, 1, H, W) -> (N, H, W) ve 0-indeksli yap
             masks = masks.to(device).squeeze(1).long()
-            masks = torch.clamp(masks, 0, 3 - 1) 
+            
+            # Etiket kaydırma işlemi
+            masks = masks - 1
+            masks = torch.clamp(masks, 0, 2) 
 
             outputs = model(images)
             predClasses = torch.argmax(outputs, dim=1)
 
-            current_saved = 0
+            # Batç içindeki her bir resmi kontrol et
             for i in range(images.size(0)):
-                if current_saved >= numSamples:
-                    break
                 
-                # 💥 DÜZELTİLMİŞ KISIM: Görüntü Normalizasyonunu Geri Alma
-                image = images[i].cpu()
-                # Önce STD ile çarp, sonra MEAN ekle (Doğru tersine çevirme)
-                image = image * STD + MEAN 
-                image_np = image.permute(1, 2, 0).numpy()
-                image_np = np.clip(image_np, 0, 1) # [0, 1] aralığına sıkıştır
-
-                gt_mask = masks[i].cpu().numpy()
-                pred_mask = predClasses[i].cpu().numpy()
-
-                # Görselleştirme
+                # Toplam numSamples limitine ulaşıldıysa, dış döngüyü durdur
+                if saved_count >= numSamples:
+                    break # İç döngüyü kır
+                
+                # --- KAYDETME KODU BAŞLANGICI (Figür oluşturma, çizme, kaydetme) ---
+                
                 fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-                
-                # 1. Orijinal Görüntü
-                axes[0].imshow(image_np)
-                axes[0].set_title("Orijinal Görüntü")
+
+                # 1) Orijinal Resim (Aynı)
+                img = images[i].cpu().permute(1,2,0).numpy()
+                img = (img - img.min()) / (img.max() - img.min()) 
+                axes[0].imshow(img)
+                axes[0].set_title("Original Image")
                 axes[0].axis("off")
-                
-                # 2. Gerçek Maske (GT)
-                im2 = axes[1].imshow(gt_mask, cmap=cmap, norm=norm)
-                axes[1].set_title("Gerçek Maske (GT)")
+
+                # 2) Ground Truth (Aynı)
+                gt_mask = masks[i].cpu().numpy().squeeze()
+                gt_color = np.zeros((*gt_mask.shape, 3))
+                for cls, color in class_colors.items():
+                    gt_color[gt_mask == cls] = color
+                axes[1].imshow(gt_color)
+                axes[1].set_title("Ground Truth")
                 axes[1].axis("off")
-                
-                # Kontur ekle (Daha iyi görünürlük için Pet sınırına)
-                contours_pet = measure.find_contours(gt_mask == 0, 0.5)
-                for contour in contours_pet:
-                    axes[1].plot(contour[:, 1], contour[:, 0], color='white', linewidth=1)
+                for cls in [0, 1, 2]:
+                    contours = measure.find_contours(gt_mask == cls, 0.5) 
+                    for contour in contours:
+                        axes[1].plot(contour[:, 1], contour[:, 0], color='white', linewidth=1)
 
-
-                # 3. Model Tahmini
-                im3 = axes[2].imshow(pred_mask, cmap=cmap, norm=norm)
-                axes[2].set_title("Model Tahmini")
+                # 3) Prediction (Aynı)
+                pred_mask = predClasses[i].cpu().numpy().squeeze()
+                pred_color = np.zeros((*pred_mask.shape, 3))
+                for cls, color in class_colors.items():
+                    pred_color[pred_mask == cls] = color
+                axes[2].imshow(pred_color)
+                axes[2].set_title("Prediction")
                 axes[2].axis("off")
-                
-                # Kontur ekle
-                contours_pred = measure.find_contours(pred_mask == 0, 0.5)
-                for contour in contours_pred:
-                    axes[2].plot(contour[:, 1], contour[:, 0], color='white', linewidth=1)
+                for cls in [0, 1, 2]:
+                    contours = measure.find_contours(pred_mask == cls, 0.5)
+                    for contour in contours:
+                        axes[2].plot(contour[:, 1], contour[:, 0], color='white', linewidth=1)
 
-
-                # Renk skalası ekleme
-                cbar_ax = fig.add_axes([0.92, 0.15, 0.01, 0.7]) 
-                cbar = fig.colorbar(im2, cax=cbar_ax, ticks=[0, 1, 2])
-                cbar.ax.set_yticklabels(class_labels)
-                cbar.ax.set_title("Sınıflar", fontsize=10)
-                
-                
-                save_path = os.path.join(saveDir, f"sample_{batch_idx}_{i}.png")
-                plt.savefig(save_path)
+                save_path = os.path.join(saveDir, f"sample_{saved_count}.png") # İsimlendirmeyi sayaçla yap
+                plt.savefig(save_path, bbox_inches='tight')
                 plt.close(fig)
-                
-                current_saved += 1
 
-            if current_saved >= numSamples:
-                break
-                
-    print(f"[INFO] {current_saved} predictions saved to {saveDir}")
+                # YENİ: Başarıyla kaydedildi, sayacı artır
+                saved_count += 1 
+            
+            # İç döngü bittiğinde, toplam limite ulaşıldıysa ana döngüyü de kır
+            if saved_count >= numSamples:
+                break 
+
+    print(f"[INFO] {saved_count} predictions saved to {saveDir}")
