@@ -8,5 +8,5 @@ unetModel = SMP.Unet(
     encoder_name="resnet34",
     encoder_weights="imagenet",
     in_channels=3,
-    classes=21
-)
+    classes=3
+).to(DEVICE)
